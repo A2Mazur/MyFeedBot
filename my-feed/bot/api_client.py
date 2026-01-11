@@ -1,0 +1,20 @@
+import os
+import httpx
+
+API_URL = os.getenv("API_URL", "http://api:8000")
+
+async def add_channel(tg_user_id: int, username: str) -> dict:
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(f"{API_URL}/channels/add", json={
+            "tg_user_id": tg_user_id,
+            "username": username
+        })
+        r.raise_for_status()
+        return r.json()
+
+async def list_channels(tg_user_id: int) -> list[str]:
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(f"{API_URL}/channels/list", params={"tg_user_id": tg_user_id})
+        r.raise_for_status()
+        data = r.json()
+        return data.get("channels", [])
