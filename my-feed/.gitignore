@@ -1,0 +1,14 @@
+
+# env files
+.env
+my-feed/.env
+
+# python venv
+venv/
+.venv/
+my-feed/venv/
+my-feed/.venv/
+
+# python cache
+__pycache__/
+*.pyc
