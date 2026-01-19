@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery
 from bot.keyboards.subscriptions import build_subscriptions_kb
 from aiogram import F
 from aiogram.exceptions import TelegramBadRequest
-
+from bot.feed_worker import feed_loop
 
 async def setup_commands(bot: Bot):
     commands = [
@@ -33,6 +33,7 @@ async def main():
     if not token:
         raise RuntimeError("BOT_TOKEN is not set in .env")
     bot = Bot(token=token)
+    asyncio.create_task(feed_loop(bot))
     dp = Dispatcher()
     await setup_commands(bot)
     @dp.message(Command("help"))
