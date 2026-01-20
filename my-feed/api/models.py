@@ -1,7 +1,6 @@
 from sqlalchemy.orm import Mapped, mapped_column
 from datetime import datetime
-from sqlalchemy import DateTime, Text, BigInteger, ForeignKey, UniqueConstraint, Boolean, String
-
+from sqlalchemy import DateTime, Text, BigInteger, ForeignKey, UniqueConstraint, Boolean, String, Integer
 from api.db import Base
 
 # Table users
@@ -9,6 +8,7 @@ class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(primary_key=True)
     tg_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    forwarding_on: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 # The table of channels that the user added
 class Channel(Base):
@@ -17,6 +17,7 @@ class Channel(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     username: Mapped[str] = mapped_column(String(255))
     __table_args__ = (UniqueConstraint("user_id", "username", name="uq_user_channel"),)
+    last_tg_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 class Post(Base):
     __tablename__ = "posts"

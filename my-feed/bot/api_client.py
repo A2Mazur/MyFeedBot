@@ -41,3 +41,39 @@ async def get_forwarding(tg_user_id: int) -> bool:
         r = await client.get(f"{API_URL}/users/forwarding", params={"tg_user_id": tg_user_id})
         r.raise_for_status()
         return bool(r.json().get("enabled", True))
+
+async def delete_channel(tg_user_id: int, username: str) -> dict:
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(f"{API_URL}/channels/delete", json={
+            "tg_user_id": tg_user_id,
+            "username": username
+        })
+        r.raise_for_status()
+        return r.json()
+
+async def delete_all_channels(tg_user_id: int) -> dict:
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(f"{API_URL}/channels/delete_all", json={
+            "tg_user_id": tg_user_id
+        })
+        r.raise_for_status()
+        return r.json()
+
+async def get_channel_cursor(tg_user_id: int, username: str) -> int | None:
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(f"{API_URL}/channels/cursor", params={
+            "tg_user_id": tg_user_id,
+            "username": username
+        })
+        r.raise_for_status()
+        return r.json().get("last_tg_message_id")
+
+async def set_channel_cursor(tg_user_id: int, username: str, last_tg_message_id: int) -> dict:
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(f"{API_URL}/channels/cursor", json={
+            "tg_user_id": tg_user_id,
+            "username": username,
+            "last_tg_message_id": last_tg_message_id
+        })
+        r.raise_for_status()
+        return r.json()

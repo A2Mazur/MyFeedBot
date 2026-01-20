@@ -18,3 +18,11 @@
 **Start project**
 
 *docker compose up --build*
+
+---
+
+### Technology stack:
+1) Architecture of a distributed system with microservice interaction via Celery and Redis
+2) Telegram bot based on Aiogram 3 for processing user commands and interacting with the API
+3) A separate service on Telethon for collecting and analyzing publications from Telegram channels
+4) Deploying the system in Docker containers

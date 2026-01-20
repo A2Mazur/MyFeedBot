@@ -1,11 +1,12 @@
 import asyncio
 import logging
 import os
+from bot.keyboards.delete import build_delete_kb, DelCb
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message, BotCommand
-from bot.api_client import add_channel, list_channels
+from bot.api_client import add_channel, list_channels, delete_channel, delete_all_channels, set_forwarding, get_forwarding
 from bot.parsers import extract_channels
 from aiogram.types import CallbackQuery
 from bot.keyboards.subscriptions import build_subscriptions_kb
@@ -35,6 +36,7 @@ async def main():
     bot = Bot(token=token)
     asyncio.create_task(feed_loop(bot))
     dp = Dispatcher()
+    welcomed_users: set[int] = set()
     await setup_commands(bot)
     @dp.message(Command("help"))
     async def cmd_help(msg: Message):
@@ -70,19 +72,39 @@ async def main():
 
     @dp.message(Command("delete"))
     async def cmd_delete(msg: Message):
-        parts = (msg.text or "").split(maxsplit=1)
-        if len(parts) < 2:
-            await msg.answer("Формат: /delete @channel")
+        channels = await list_channels(msg.from_user.id)
+        if not channels:
+            await msg.answer("Подписок пока нет. /subscriptions — посмотреть список")
             return
-        await msg.answer("Удаление сделаем следующим шагом (нужен endpoint в API).")
+        text = "Выберите канал для удаления:"
+        kb = build_delete_kb(channels, page=0)
+        await msg.answer(text, reply_markup=kb)
+
+    WELCOME_TEXT = (
+        "👋 Добро пожаловать!\n\n"
+        "Я — твоя персональная лента новостей из Telegram 📲\n\n"
+        "📌 Как пользоваться:\n"
+        "— Отправь ссылку или @ник канала, чтобы подписаться.\n"
+        "— Посты будут приходить прямо сюда.\n"
+        "— Для полного списка команд используй /help.\n\n"
+        "✨ Хочешь до 50 каналов, сводки ИИ и фильтр рекламы? Жми /vip."
+    )
 
     @dp.message(Command("start"))
     async def cmd_start_forward(msg: Message):
-        await msg.answer("Ок Пересылка будет реализована после подключения collector-а.")
+        user_id = msg.from_user.id
+        if user_id not in welcomed_users:
+            welcomed_users.add(user_id)
+            await msg.answer(WELCOME_TEXT)
+        await set_forwarding(user_id, True)
+        await msg.answer("Пересылка сообщений активирована ✅")
 
     @dp.message(Command("stop"))
     async def cmd_stop_forward(msg: Message):
-        await msg.answer("Ок  Пересылка будет реализована после подключения collector-а.")
+        user_id = msg.from_user.id
+        await set_forwarding(user_id, False)
+        await msg.answer("Пересылка сообщений остановлена ⛔️")
+
 
     @dp.message(Command("digest"))
     async def cmd_digest(msg: Message):
@@ -134,8 +156,6 @@ async def main():
         reply.append("\n/subscriptions — посмотреть список")
         await msg.answer("\n".join(reply))
 
-    await dp.start_polling(bot)
-    
     @dp.callback_query(F.data.startswith("subs_page:"))
     async def cb_subs_page(cb: CallbackQuery):
         page = int(cb.data.split(":")[1])
@@ -151,6 +171,53 @@ async def main():
                 raise
 
         await cb.answer()
+
+    @dp.callback_query(DelCb.filter())
+    async def cb_delete(cb: CallbackQuery, callback_data: DelCb):
+        channels = await list_channels(cb.from_user.id)
+        if callback_data.action == "page":
+            page = max(0, callback_data.page)
+            text = "Выберите канал для удаления:"
+            kb = build_delete_kb(channels, page=page)
+
+            try:
+                await cb.message.edit_text(text, reply_markup=kb)
+            except TelegramBadRequest as e:
+                if "message is not modified" not in str(e).lower():
+                    raise
+
+            await cb.answer()
+            return
+        if callback_data.action == "ch" and callback_data.username:
+            username = callback_data.username
+            await delete_channel(cb.from_user.id, username)
+            channels = await list_channels(cb.from_user.id)
+            if not channels:
+                await cb.message.edit_text("✅ Все каналы удалены.\n\nТеперь список пуст.")
+                await cb.answer()
+                return
+            page = max(0, callback_data.page)
+            page_size = 10
+            max_page = max(0, (len(channels) - 1) // page_size)
+            page = min(page, max_page)
+
+            text = f"✅ Канал {username} удалён из ваших подписок.\n\nВыберите канал для удаления:"
+            kb = build_delete_kb(channels, page=page)
+            await cb.message.edit_text(text, reply_markup=kb)
+            await cb.answer()
+            return
+        if callback_data.action == "all":
+            await delete_all_channels(cb.from_user.id)
+            await cb.message.edit_text("✅ Все каналы удалены.\n\nТеперь список пуст.")
+            await cb.answer()
+            return
+
+        await cb.answer("Неизвестное действие", show_alert=True)
+
+
+
+    await dp.start_polling(bot)
+    
 
 if __name__ == "__main__":
     asyncio.run(main())

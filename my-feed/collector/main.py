@@ -27,22 +27,47 @@ async def send_post(api: httpx.AsyncClient, channel: str, msg_id: int, text: str
     r = await api.post(f"{API_URL}/posts/add", json=payload)
     r.raise_for_status()
 
+async def get_cursor(api: httpx.AsyncClient, channel: str) -> int | None:
+    r = await api.get(f"{API_URL}/channels/cursor", params={
+        "tg_user_id": OWNER_TG_USER_ID,
+        "username": channel
+    })
+    r.raise_for_status()
+    v = r.json().get("last_tg_message_id")
+    return int(v) if v is not None else None
+
+async def set_cursor(api: httpx.AsyncClient, channel: str, last_id: int) -> None:
+    r = await api.post(f"{API_URL}/channels/cursor", json={
+        "tg_user_id": OWNER_TG_USER_ID,
+        "username": channel,
+        "last_tg_message_id": int(last_id)
+    })
+    r.raise_for_status()
+
+
 async def main():
     tg = build_client()
     await tg.start()
     async with httpx.AsyncClient(timeout=20) as api:
-        last_seen: dict[str, int] = {}
         while True:
             channels = await fetch_channels(api)
+
             for ch in channels:
                 try:
                     entity = await tg.get_entity(ch)
-                    messages = await tg.get_messages(entity, limit=20)
-                    for m in reversed(messages):
-                        if not m.id or not m.message:
-                            continue
-                        if last_seen.get(ch, 0) >= m.id:
-                            continue
+                    cursor = await get_cursor(api, ch)
+                    msgs = await tg.get_messages(entity, limit=1)
+                    if not msgs:
+                        continue
+
+                    m = msgs[0]
+                    if not m.id or not m.message:
+                        continue
+                    if cursor is None:
+                        await set_cursor(api, ch, m.id)
+                        logging.info(f"Baseline set for {ch}: last_tg_message_id={m.id} (no send)")
+                        continue
+                    if m.id > cursor:
                         published = m.date
                         if published.tzinfo is None:
                             published = published.replace(tzinfo=timezone.utc)
@@ -53,11 +78,14 @@ async def main():
                             text=m.message,
                             published_at=published.isoformat(),
                         )
-                        last_seen[ch] = m.id
-                    logging.info(f"Collected from {ch}")
+                        await set_cursor(api, ch, m.id)
+                        logging.info(f"New post from {ch}: {m.id}")
+                    else:
+                        logging.info(f"No new posts in {ch} (cursor={cursor}, last={m.id})")
                 except Exception as e:
                     logging.exception(f"Collector error for {ch}: {e}")
             await asyncio.sleep(INTERVAL)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
