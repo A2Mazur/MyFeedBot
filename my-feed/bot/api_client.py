@@ -29,3 +29,15 @@ async def mark_posts_sent(post_ids: list[int]) -> None:
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(f"{API_URL}/posts/mark_sent", json=post_ids)
         r.raise_for_status()
+
+async def set_forwarding(tg_user_id: int, enabled: bool) -> dict:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(f"{API_URL}/users/forwarding", params={"tg_user_id": tg_user_id}, json=enabled)
+        r.raise_for_status()
+        return r.json()
+
+async def get_forwarding(tg_user_id: int) -> bool:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(f"{API_URL}/users/forwarding", params={"tg_user_id": tg_user_id})
+        r.raise_for_status()
+        return bool(r.json().get("enabled", True))

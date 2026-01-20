@@ -1,12 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
 from datetime import datetime
 from api.db import engine, SessionLocal, Base
 import api.models
 from api.models import User, Channel, Post
-from sqlalchemy import desc, update
-
+from sqlalchemy import desc, update, select
 
 app = FastAPI(title="MyFeed API")
 
@@ -152,3 +150,4 @@ async def mark_posts_sent(post_ids: list[int]):
         )
         await session.commit()
     return {"ok": True}
+
