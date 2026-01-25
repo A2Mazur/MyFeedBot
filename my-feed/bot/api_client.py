@@ -72,6 +72,21 @@ async def set_short_feed(tg_user_id: int, enabled: bool) -> dict:
         r.raise_for_status()
         return r.json()
 
+async def get_vip_status(tg_user_id: int) -> dict:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(f"{API_URL}/users/vip_status", params={"tg_user_id": tg_user_id})
+        r.raise_for_status()
+        return r.json()
+
+async def extend_vip(tg_user_id: int, days: int) -> dict:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(f"{API_URL}/users/vip_extend", json={
+            "tg_user_id": tg_user_id,
+            "days": days,
+        })
+        r.raise_for_status()
+        return r.json()
+
 async def delete_channel(tg_user_id: int, username: str) -> dict:
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(f"{API_URL}/channels/delete", json={

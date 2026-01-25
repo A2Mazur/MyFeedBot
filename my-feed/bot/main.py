@@ -1,19 +1,167 @@
 import asyncio
 import logging
 import os
-from bot.keyboards.delete import build_delete_kb, DelCb
+import uuid
 
-from aiogram import Bot, Dispatcher
-from aiogram.filters import Command
-from aiogram.types import Message, BotCommand
-from bot.api_client import add_channel, list_channels, delete_channel, delete_all_channels, set_forwarding, get_forwarding, get_latest_posts, get_spam_filter, set_spam_filter, get_short_feed, set_short_feed
-from bot.parsers import extract_channels
-from aiogram.types import CallbackQuery
-from bot.keyboards.subscriptions import build_subscriptions_kb
-from aiogram import F
+import httpx
+from datetime import datetime, timezone
+from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
-from bot.feed_worker import feed_loop
+from aiogram.filters import Command
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+)
+from bot.api_client import (
+    add_channel,
+    delete_all_channels,
+    delete_channel,
+    get_forwarding,
+    get_latest_posts,
+    get_vip_status,
+    get_short_feed,
+    get_spam_filter,
+    list_channels,
+    extend_vip,
+    set_forwarding,
+    set_short_feed,
+    set_spam_filter,
+)
 from bot.digest import select_recent_posts, generate_digest
+from bot.feed_worker import feed_loop
+from bot.keyboards.delete import build_delete_kb, DelCb
+from bot.keyboards.subscriptions import build_subscriptions_kb
+from bot.keyboards.vip import (
+    VipCb,
+    build_vip_payment_kb,
+    build_vip_stars_kb,
+    build_vip_tariffs_kb,
+    get_tariff,
+)
+from bot.parsers import extract_channels
+
+
+async def yk_create_payment(user_id: int, plan: str) -> tuple[str, str]:
+    shop_id = os.getenv("YOOKASSA_SHOP_ID")
+    secret_key = os.getenv("YOOKASSA_SECRET_KEY")
+    tax_system_code = int(os.getenv("YOOKASSA_TAX_SYSTEM_CODE", "1"))
+    if not shop_id or not secret_key:
+        raise RuntimeError("YOOKASSA_SHOP_ID/YOOKASSA_SECRET_KEY are not set in .env")
+    receipt_email = os.getenv("YOOKASSA_RECEIPT_EMAIL") or f"user{user_id}@example.com"
+
+    tariff = get_tariff(plan)
+    amount_value = f"{tariff['price']:.2f}"
+    return_url = os.getenv("YOOKASSA_RETURN_URL", "https://t.me")
+    idempotence_key = str(uuid.uuid4())
+
+    payload = {
+        "amount": {"value": amount_value, "currency": "RUB"},
+        "confirmation": {"type": "redirect", "return_url": return_url},
+        "capture": True,
+        "description": f"VIP на {tariff['title']}",
+        "metadata": {"user_id": user_id, "plan": plan},
+        "receipt": {
+            "customer": {"email": receipt_email},
+            "tax_system_code": tax_system_code,
+            "items": [
+                {
+                    "description": f"VIP на {tariff['title']}",
+                    "quantity": "1.00",
+                    "amount": {"value": amount_value, "currency": "RUB"},
+                    "vat_code": 1,
+                    "payment_subject": "service",
+                    "payment_mode": "full_prepayment",
+                }
+            ],
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.post(
+                "https://api.yookassa.ru/v3/payments",
+                auth=(shop_id, secret_key),
+                headers={"Idempotence-Key": idempotence_key},
+                json=payload,
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text.strip()
+            raise RuntimeError(f"YooKassa error: {detail}") from e
+        data = resp.json()
+        return data["id"], data["confirmation"]["confirmation_url"]
+
+
+async def yk_check_payment(payment_id: str) -> str:
+    shop_id = os.getenv("YOOKASSA_SHOP_ID")
+    secret_key = os.getenv("YOOKASSA_SECRET_KEY")
+    if not shop_id or not secret_key:
+        raise RuntimeError("YOOKASSA_SHOP_ID/YOOKASSA_SECRET_KEY are not set in .env")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"https://api.yookassa.ru/v3/payments/{payment_id}",
+            auth=(shop_id, secret_key),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("status", "unknown")
+
+
+def format_vip_until(iso_value: str | None) -> str | None:
+    if not iso_value:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%d.%m.%Y")
+
+
+def build_vip_screen_text(vip_until_iso: str | None) -> str:
+    vip_date = format_vip_until(vip_until_iso)
+    if vip_date:
+        header = f"🔒 Подписка активна до {vip_date}\n\n"
+    else:
+        header = "🔒 Подписка не активна\n\n"
+    return (
+        header
+        + "📌 Тарифы для подписчиков\n\n"
+        + "💎 VIP-подписка\n"
+        + "— Возможность добавить до 50 каналов (у обычных пользователей — максимум 10).\n"
+        + "— Доступ к ИИ-опциям: краткая лента, сжатие постов, сводка новостей.\n"
+        + "— Возможность отключить рекламные и партнёрские посты каналов.\n"
+        + "— Приоритетная поддержка и более быстрая доставка постов.\n\n"
+        + "Выберите тариф:"
+    )
+
+
+def get_tariff_days(plan: str, tariff: dict) -> int | None:
+    days = tariff.get("days")
+    if days:
+        return int(days)
+    fallback = {"7d": 7, "1m": 30, "12m": 365}
+    return fallback.get(plan)
+
+
+async def ensure_vip(msg: Message, feature_name: str, feature_desc: str) -> bool:
+    status = await get_vip_status(msg.from_user.id)
+    if status.get("active"):
+        return True
+    text = (
+        "🔒 Эта функция доступна только для VIP-пользователей.\n\n"
+        f"{feature_name} — {feature_desc}\n\n"
+        "🚀 Оформите подписку через команду /vip — и получите доступ к функциям."
+    )
+    await msg.answer(text)
+    return False
 
 async def setup_commands(bot: Bot):
     commands = [
@@ -38,6 +186,9 @@ async def main():
     asyncio.create_task(feed_loop(bot))
     dp = Dispatcher()
     welcomed_users: set[int] = set()
+    card_payments: dict[tuple[int, str], str] = {}
+    stars_payloads: dict[str, str] = {}
+    stars_last_plan: dict[int, str] = {}
     await setup_commands(bot)
     @dp.message(Command("help"))
     async def cmd_help(msg: Message):
@@ -109,6 +260,8 @@ async def main():
 
     @dp.message(Command("digest"))
     async def cmd_digest(msg: Message):
+        if not await ensure_vip(msg, "Digest", "умная сводка новостей."):
+            return
         await msg.answer("Готовлю сводку... 📝")
         posts = await get_latest_posts(msg.from_user.id, limit=50)
         recent = select_recent_posts(posts, hours=12, limit=20)
@@ -120,6 +273,8 @@ async def main():
 
     @dp.message(Command("spam"))
     async def cmd_spam(msg: Message):
+        if not await ensure_vip(msg, "Spam", "фильтр, скрывающий рекламные публикации."):
+            return
         user_id = msg.from_user.id
         enabled = await get_spam_filter(user_id)
         new_state = not enabled
@@ -131,6 +286,8 @@ async def main():
 
     @dp.message(Command("switch_feed"))
     async def cmd_switch_feed(msg: Message):
+        if not await ensure_vip(msg, "Switch Feed", "переключение между полной и краткой лентой."):
+            return
         user_id = msg.from_user.id
         enabled = await get_short_feed(user_id)
         new_state = not enabled
@@ -142,10 +299,14 @@ async def main():
 
     @dp.message(Command("vip"))
     async def cmd_vip(msg: Message):
-        await msg.answer("VIP/оплата будет позже (после MVP).")
+        status = await get_vip_status(msg.from_user.id)
+        text = build_vip_screen_text(status.get("vip_until"))
+        await msg.answer(text, reply_markup=build_vip_tariffs_kb())
 
     @dp.message()
     async def any_text(msg: Message):
+        if msg.successful_payment:
+            return
         text = msg.text or ""
         channels = extract_channels(text)
 
@@ -156,12 +317,16 @@ async def main():
         added = 0
         already = 0
         errors = 0
+        limit_reached = None
 
         for ch in channels:
             try:
                 res = await add_channel(msg.from_user.id, ch)
                 if res.get("message") == "already added":
                     already += 1
+                elif res.get("message") == "limit reached":
+                    limit_reached = res.get("limit")
+                    break
                 else:
                     added += 1
             except Exception:
@@ -172,6 +337,8 @@ async def main():
             reply.append(f"Добавлено ✅: {added}")
         if already:
             reply.append(f"Уже было 👍: {already}")
+        if limit_reached:
+            reply.append(f"🚫 Достигнут лимит: {limit_reached} каналов. /vip — увеличить лимит.")
         if errors:
             reply.append(f"Ошибки ⚠️: {errors}")
 
@@ -235,6 +402,159 @@ async def main():
             return
 
         await cb.answer("Неизвестное действие", show_alert=True)
+
+    @dp.callback_query(VipCb.filter())
+    async def cb_vip(cb: CallbackQuery, callback_data: VipCb):
+        if callback_data.action == "plan" and callback_data.plan:
+            tariff = get_tariff(callback_data.plan)
+            text = (
+                f"Вы выбрали подписку на {tariff['title']}. "
+                "Выберите способ оплаты:"
+            )
+            await cb.message.edit_text(
+                text,
+                reply_markup=build_vip_payment_kb(callback_data.plan),
+            )
+            await cb.answer()
+            return
+
+        if callback_data.action == "back_pay" and callback_data.plan:
+            tariff = get_tariff(callback_data.plan)
+            text = (
+                f"Вы выбрали подписку на {tariff['title']}. "
+                "Выберите способ оплаты:"
+            )
+            await cb.message.edit_text(
+                text,
+                reply_markup=build_vip_payment_kb(callback_data.plan),
+            )
+            await cb.answer()
+            return
+
+        if callback_data.action == "back":
+            status = await get_vip_status(cb.from_user.id)
+            text = build_vip_screen_text(status.get("vip_until"))
+            await cb.message.edit_text(text, reply_markup=build_vip_tariffs_kb())
+            await cb.answer()
+            return
+
+        if callback_data.action == "pay_card" and callback_data.plan:
+            plan = callback_data.plan
+            try:
+                payment_id, confirmation_url = await yk_create_payment(cb.from_user.id, plan)
+            except Exception as e:
+                await cb.message.edit_text(f"❌ Не удалось создать платёж: {e}")
+                await cb.answer()
+                return
+
+            card_payments[(cb.from_user.id, plan)] = payment_id
+            tariff = get_tariff(plan)
+            kb = [
+                [InlineKeyboardButton(text=f"💳 Оплатить {tariff['price']}₽", url=confirmation_url)],
+                [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=VipCb(action="check_card", plan=plan).pack())],
+                [InlineKeyboardButton(text="← Назад", callback_data=VipCb(action="back_pay", plan=plan).pack())],
+            ]
+            await cb.message.edit_text(
+                text="Нажмите «Оплатить», завершите оплату и затем вернитесь сюда и нажмите «Проверить оплату».",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+            )
+            await cb.answer()
+            return
+
+
+        if callback_data.action == "pay_stars" and callback_data.plan:
+            tariff = get_tariff(callback_data.plan)
+
+            provider_token = os.getenv("STARS_PROVIDER_TOKEN", "STARS")
+            payload = f"vip:{callback_data.plan}:{uuid.uuid4()}"
+
+            try:
+                invoice_url = await cb.bot.create_invoice_link(
+                    title="VIP-подписка",
+                    description=f"VIP на {tariff['title']}",
+                    payload=payload,
+                    provider_token=provider_token,
+                    currency="XTR",
+                    prices=[LabeledPrice(label=tariff["title"], amount=tariff["stars"])],
+                )
+            except Exception as e:
+                await cb.message.edit_text(f"❌ Не удалось подготовить оплату Stars: {e}")
+                await cb.answer()
+                return
+            stars_payloads[payload] = callback_data.plan
+            stars_last_plan[cb.from_user.id] = callback_data.plan
+
+            text = (
+                "Стоимость премиума:\n"
+                f"~{tariff['price']}₽ / $1.99 или {tariff['stars']} Telegram Stars за {tariff['title']}\n\n"
+                "🚨 Если вы из России, вы можете купить Stars на 40% дешевле в официальном боте "
+                "Телеграма: @premiumbot"
+            )
+
+            await cb.message.edit_text(
+                text,
+                reply_markup=build_vip_stars_kb(callback_data.plan, invoice_url=invoice_url),
+                disable_web_page_preview=True,
+            )
+            await cb.answer()
+            return
+
+        if callback_data.action == "check_card" and callback_data.plan:
+            plan = callback_data.plan
+            payment_id = card_payments.get((cb.from_user.id, plan))
+            if not payment_id:
+                await cb.answer("Платёж не найден. Нажмите «Оплатить» ещё раз.", show_alert=True)
+                return
+
+            try:
+                status = await yk_check_payment(payment_id)
+            except Exception as e:
+                await cb.answer(f"❌ Ошибка проверки: {e}", show_alert=True)
+                return
+
+            if status == "succeeded":
+                tariff = get_tariff(plan)
+                days = get_tariff_days(plan, tariff)
+                if not days:
+                    await cb.message.edit_text("⚠️ Не удалось активировать VIP: отсутствует срок тарифа.")
+                    return
+                vip_res = await extend_vip(cb.from_user.id, int(days))
+                vip_date = format_vip_until(vip_res.get("vip_until"))
+                if vip_date:
+                    await cb.message.edit_text(f"✅ Оплата прошла успешно. Подписка активна до {vip_date}.")
+                else:
+                    await cb.message.edit_text("✅ Оплата прошла успешно. Доступ к VIP включён.")
+            else:
+                await cb.answer("⏳ Платёж ещё не завершён. Попробуйте позже.", show_alert=True)
+            return
+
+        await cb.answer("Неизвестное действие", show_alert=True)
+
+    @dp.pre_checkout_query()
+    async def pre_checkout_query(pre_checkout: PreCheckoutQuery):
+        await pre_checkout.answer(ok=True)
+
+    @dp.message(F.successful_payment)
+    async def on_successful_payment(msg: Message):
+        payload = msg.successful_payment.invoice_payload
+        plan = None
+        if payload.startswith("vip:"):
+            parts = payload.split(":")
+            if len(parts) >= 2:
+                plan = parts[1]
+        if not plan:
+            plan = stars_payloads.get(payload) or stars_last_plan.get(msg.from_user.id)
+        if plan:
+            tariff = get_tariff(plan)
+            days = get_tariff_days(plan, tariff)
+            if not days:
+                await msg.answer("⚠️ Не удалось активировать VIP: отсутствует срок тарифа.")
+                return
+            vip_res = await extend_vip(msg.from_user.id, int(days))
+            text = build_vip_screen_text(vip_res.get("vip_until"))
+            await msg.answer(text, reply_markup=build_vip_tariffs_kb())
+            return
+        await msg.answer("✅ Оплата прошла успешно. Доступ к VIP включён.")
 
 
 

@@ -1,10 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from api.db import engine, SessionLocal, Base
 import api.models
 from api.models import User, Channel, Post
-from sqlalchemy import desc, update, select, text
+from sqlalchemy import desc, update, select, text, func
 from fastapi import Body
 import re
 
@@ -33,6 +33,10 @@ class SetCursorIn(BaseModel):
     tg_user_id: int
     username: str
     last_tg_message_id: int
+
+class VipExtendIn(BaseModel):
+    tg_user_id: int
+    days: int
 
 
 AD_PATTERNS = [
@@ -79,6 +83,12 @@ async def on_startup():
                 "ADD COLUMN IF NOT EXISTS short_feed_on BOOLEAN NOT NULL DEFAULT FALSE"
             )
         )
+        await conn.execute(
+            text(
+                "ALTER TABLE users "
+                "ADD COLUMN IF NOT EXISTS vip_until TIMESTAMPTZ NULL"
+            )
+        )
 
 @app.get("/health")
 def health():
@@ -97,6 +107,15 @@ async def add_channel(payload: AddChannelIn):
             user = User(tg_user_id=payload.tg_user_id)
             session.add(user)
             await session.flush() 
+        now = datetime.now(timezone.utc)
+        vip_active = bool(user.vip_until and user.vip_until > now)
+        limit = 50 if vip_active else 10
+        res = await session.execute(
+            select(func.count(Channel.id)).where(Channel.user_id == user.id)
+        )
+        channel_count = int(res.scalar() or 0)
+        if channel_count >= limit:
+            return {"ok": False, "message": "limit reached", "limit": limit}
         res = await session.execute(
             select(Channel).where(Channel.user_id == user.id, Channel.username == username)
         )
@@ -385,3 +404,36 @@ async def set_user_short_feed(tg_user_id: int, enabled: bool = Body(...)):
         user.short_feed_on = bool(enabled)
         await session.commit()
         return {"ok": True, "enabled": bool(user.short_feed_on)}
+
+
+@app.get("/users/vip_status")
+async def get_user_vip_status(tg_user_id: int):
+    async with SessionLocal() as session:
+        res = await session.execute(select(User).where(User.tg_user_id == tg_user_id))
+        user = res.scalar_one_or_none()
+        vip_until = user.vip_until if user else None
+        now = datetime.now(timezone.utc)
+        active = bool(vip_until and vip_until > now)
+        return {
+            "active": active,
+            "vip_until": vip_until.isoformat() if vip_until else None,
+        }
+
+
+@app.post("/users/vip_extend")
+async def extend_user_vip(payload: VipExtendIn):
+    if payload.days <= 0:
+        raise HTTPException(400, "days must be > 0")
+    async with SessionLocal() as session:
+        res = await session.execute(select(User).where(User.tg_user_id == payload.tg_user_id))
+        user = res.scalar_one_or_none()
+        if not user:
+            user = User(tg_user_id=payload.tg_user_id)
+            session.add(user)
+            await session.flush()
+
+        now = datetime.now(timezone.utc)
+        base = user.vip_until if user.vip_until and user.vip_until > now else now
+        user.vip_until = base + timedelta(days=payload.days)
+        await session.commit()
+        return {"ok": True, "vip_until": user.vip_until.isoformat()}
