@@ -6,13 +6,14 @@ from bot.keyboards.delete import build_delete_kb, DelCb
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message, BotCommand
-from bot.api_client import add_channel, list_channels, delete_channel, delete_all_channels, set_forwarding, get_forwarding
+from bot.api_client import add_channel, list_channels, delete_channel, delete_all_channels, set_forwarding, get_forwarding, get_latest_posts, get_spam_filter, set_spam_filter, get_short_feed, set_short_feed
 from bot.parsers import extract_channels
 from aiogram.types import CallbackQuery
 from bot.keyboards.subscriptions import build_subscriptions_kb
 from aiogram import F
 from aiogram.exceptions import TelegramBadRequest
 from bot.feed_worker import feed_loop
+from bot.digest import select_recent_posts, generate_digest
 
 async def setup_commands(bot: Bot):
     commands = [
@@ -108,15 +109,36 @@ async def main():
 
     @dp.message(Command("digest"))
     async def cmd_digest(msg: Message):
-        await msg.answer("Сводка пока не готова. Сначала подключим сбор постов и обработку.")
+        await msg.answer("Готовлю сводку... 📝")
+        posts = await get_latest_posts(msg.from_user.id, limit=50)
+        recent = select_recent_posts(posts, hours=12, limit=20)
+        if not recent:
+            await msg.answer("За последние 12 часов нет постов для сводки.")
+            return
+        digest = await generate_digest(recent)
+        await msg.answer(digest, parse_mode="HTML", disable_web_page_preview=True)
 
     @dp.message(Command("spam"))
     async def cmd_spam(msg: Message):
-        await msg.answer("Фильтр рекламы сделаем после появления постов (нужны данные).")
+        user_id = msg.from_user.id
+        enabled = await get_spam_filter(user_id)
+        new_state = not enabled
+        await set_spam_filter(user_id, new_state)
+        if new_state:
+            await msg.answer("✅ Фильтр рекламы включён. Партнёрские/рекламные посты больше не будут приходить.")
+        else:
+            await msg.answer("✅ Фильтр рекламы выключен. Буду присылать все посты.")
 
     @dp.message(Command("switch_feed"))
     async def cmd_switch_feed(msg: Message):
-        await msg.answer("Переключение ленты сделаем после MVP дайджеста.")
+        user_id = msg.from_user.id
+        enabled = await get_short_feed(user_id)
+        new_state = not enabled
+        await set_short_feed(user_id, new_state)
+        if new_state:
+            await msg.answer("✅ Включён режим «Для тех, кто ценит время».")
+        else:
+            await msg.answer("✅ Обычный режим ленты снова активен.")
 
     @dp.message(Command("vip"))
     async def cmd_vip(msg: Message):

@@ -61,8 +61,11 @@ async def main():
                         continue
 
                     m = msgs[0]
-                    if not m.id or not m.message:
+                    if not m.id:
                         continue
+                    text = (m.message or "").strip()
+                    if not text and getattr(m, "media", None):
+                        text = "[media]"
                     if cursor is None:
                         await set_cursor(api, ch, m.id)
                         logging.info(f"Baseline set for {ch}: last_tg_message_id={m.id} (no send)")
@@ -71,13 +74,16 @@ async def main():
                         published = m.date
                         if published.tzinfo is None:
                             published = published.replace(tzinfo=timezone.utc)
-                        await send_post(
-                            api,
-                            channel=ch,
-                            msg_id=m.id,
-                            text=m.message,
-                            published_at=published.isoformat(),
-                        )
+                        if text:
+                            await send_post(
+                                api,
+                                channel=ch,
+                                msg_id=m.id,
+                                text=text,
+                                published_at=published.isoformat(),
+                            )
+                        else:
+                            logging.info(f"Skipped empty post from {ch}: {m.id}")
                         await set_cursor(api, ch, m.id)
                         logging.info(f"New post from {ch}: {m.id}")
                     else:

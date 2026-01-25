@@ -4,8 +4,9 @@ from datetime import datetime
 from api.db import engine, SessionLocal, Base
 import api.models
 from api.models import User, Channel, Post
-from sqlalchemy import desc, update, select
+from sqlalchemy import desc, update, select, text
 from fastapi import Body
+import re
 
 
 app = FastAPI(title="MyFeed API")
@@ -34,10 +35,50 @@ class SetCursorIn(BaseModel):
     last_tg_message_id: int
 
 
+AD_PATTERNS = [
+    r"\bреклама\b",
+    r"\bспонсор\b",
+    r"\bпартнер(?:ский|ская|ское|ские)?\b",
+    r"\bпромокод\b",
+    r"\bскидк[аиу]\b",
+    r"\bакци[яи]\b",
+    r"\bкупить\b",
+    r"\bзакажи\b",
+    r"\bподписывайся\b",
+    r"\bподпишись\b",
+    r"\bрозыгрыш\b",
+    r"\bдарим\b",
+    r"\bsale\b",
+    r"\bad\b",
+    r"\bsponsored\b",
+    r"\bpromo\b",
+]
+AD_RE = re.compile("|".join(AD_PATTERNS), re.IGNORECASE)
+
+
+def looks_like_ad(text_value: str) -> bool:
+    text_value = (text_value or "").strip()
+    if not text_value:
+        return False
+    return bool(AD_RE.search(text_value))
+
+
 @app.on_event("startup")
 async def on_startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text(
+                "ALTER TABLE users "
+                "ADD COLUMN IF NOT EXISTS spam_filter_on BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE users "
+                "ADD COLUMN IF NOT EXISTS short_feed_on BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )
 
 @app.get("/health")
 def health():
@@ -236,11 +277,22 @@ async def unsent_posts(tg_user_id: int, limit: int = 10):
             .join(Channel, Post.channel_id == Channel.id)
             .where(Channel.user_id == user.id, Post.is_sent == False)
             .order_by(Post.published_at)
-            .limit(limit)
+            .limit(limit * 3)
         )
         posts = []
+        skipped_ids = []
         for post, username in res.all():
+            if bool(user.spam_filter_on) and looks_like_ad(post.text):
+                skipped_ids.append(post.id)
+                continue
             posts.append({"id": post.id, "channel": username, "text": post.text})
+            if len(posts) >= limit:
+                break
+        if skipped_ids:
+            await session.execute(
+                update(Post).where(Post.id.in_(skipped_ids)).values(is_sent=True)
+            )
+            await session.commit()
         return {"posts": posts}
 
 @app.post("/posts/mark_sent")
@@ -279,3 +331,57 @@ async def set_user_forwarding(tg_user_id: int, enabled: bool = Body(...)):
         await session.commit()
         return {"ok": True, "enabled": bool(user.forwarding_on)}
 
+
+@app.get("/users/spam_filter")
+async def get_user_spam_filter(tg_user_id: int):
+    async with SessionLocal() as session:
+        res = await session.execute(select(User).where(User.tg_user_id == tg_user_id))
+        user = res.scalar_one_or_none()
+        return {"enabled": bool(user.spam_filter_on) if user else False}
+
+
+@app.post("/users/spam_filter")
+async def set_user_spam_filter(tg_user_id: int, enabled: bool = Body(...)):
+    async with SessionLocal() as session:
+        res = await session.execute(select(User).where(User.tg_user_id == tg_user_id))
+        user = res.scalar_one_or_none()
+
+        if not user:
+            user = User(tg_user_id=tg_user_id, forwarding_on=True, spam_filter_on=bool(enabled))
+            session.add(user)
+            await session.commit()
+            return {"ok": True, "enabled": bool(user.spam_filter_on)}
+
+        user.spam_filter_on = bool(enabled)
+        await session.commit()
+        return {"ok": True, "enabled": bool(user.spam_filter_on)}
+
+
+@app.get("/users/short_feed")
+async def get_user_short_feed(tg_user_id: int):
+    async with SessionLocal() as session:
+        res = await session.execute(select(User).where(User.tg_user_id == tg_user_id))
+        user = res.scalar_one_or_none()
+        return {"enabled": bool(user.short_feed_on) if user else False}
+
+
+@app.post("/users/short_feed")
+async def set_user_short_feed(tg_user_id: int, enabled: bool = Body(...)):
+    async with SessionLocal() as session:
+        res = await session.execute(select(User).where(User.tg_user_id == tg_user_id))
+        user = res.scalar_one_or_none()
+
+        if not user:
+            user = User(
+                tg_user_id=tg_user_id,
+                forwarding_on=True,
+                spam_filter_on=False,
+                short_feed_on=bool(enabled),
+            )
+            session.add(user)
+            await session.commit()
+            return {"ok": True, "enabled": bool(user.short_feed_on)}
+
+        user.short_feed_on = bool(enabled)
+        await session.commit()
+        return {"ok": True, "enabled": bool(user.short_feed_on)}

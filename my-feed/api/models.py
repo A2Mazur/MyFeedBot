@@ -9,6 +9,8 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     tg_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     forwarding_on: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    spam_filter_on: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    short_feed_on: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 # The table of channels that the user added
 class Channel(Base):

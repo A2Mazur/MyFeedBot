@@ -54,6 +54,7 @@ services:
       - redis
     volumes:
       - .:/app
+      - ./collector2.session:/app/collector2.session
 
   worker:
     build: .
