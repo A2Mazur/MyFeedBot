@@ -4,13 +4,16 @@ import os
 import uuid
 
 import httpx
+import qrcode
 from datetime import datetime, timezone
+from io import BytesIO
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
@@ -46,7 +49,16 @@ from bot.keyboards.vip import (
 from bot.parsers import extract_channels
 
 
-async def yk_create_payment(user_id: int, plan: str) -> tuple[str, str]:
+class YkBadRequestError(Exception):
+    pass
+
+
+async def yk_create_payment(
+    user_id: int,
+    plan: str,
+    confirmation_type: str = "redirect",
+    payment_method_data: dict | None = None,
+) -> tuple[str, dict]:
     shop_id = os.getenv("YOOKASSA_SHOP_ID")
     secret_key = os.getenv("YOOKASSA_SECRET_KEY")
     tax_system_code = int(os.getenv("YOOKASSA_TAX_SYSTEM_CODE", "1"))
@@ -59,9 +71,10 @@ async def yk_create_payment(user_id: int, plan: str) -> tuple[str, str]:
     return_url = os.getenv("YOOKASSA_RETURN_URL", "https://t.me")
     idempotence_key = str(uuid.uuid4())
 
+    confirmation = {"type": confirmation_type, "return_url": return_url}
     payload = {
         "amount": {"value": amount_value, "currency": "RUB"},
-        "confirmation": {"type": "redirect", "return_url": return_url},
+        "confirmation": confirmation,
         "capture": True,
         "description": f"VIP на {tariff['title']}",
         "metadata": {"user_id": user_id, "plan": plan},
@@ -80,6 +93,8 @@ async def yk_create_payment(user_id: int, plan: str) -> tuple[str, str]:
             ],
         },
     }
+    if payment_method_data:
+        payload["payment_method_data"] = payment_method_data
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
@@ -92,9 +107,11 @@ async def yk_create_payment(user_id: int, plan: str) -> tuple[str, str]:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             detail = e.response.text.strip()
+            if e.response.status_code == 400:
+                raise YkBadRequestError(detail) from e
             raise RuntimeError(f"YooKassa error: {detail}") from e
         data = resp.json()
-        return data["id"], data["confirmation"]["confirmation_url"]
+        return data["id"], data["confirmation"]
 
 
 async def yk_check_payment(payment_id: str) -> str:
@@ -187,6 +204,7 @@ async def main():
     dp = Dispatcher()
     welcomed_users: set[int] = set()
     card_payments: dict[tuple[int, str], str] = {}
+    qr_payments: dict[tuple[int, str], str] = {}
     stars_payloads: dict[str, str] = {}
     stars_last_plan: dict[int, str] = {}
     await setup_commands(bot)
@@ -248,6 +266,12 @@ async def main():
         if user_id not in welcomed_users:
             welcomed_users.add(user_id)
             await msg.answer(WELCOME_TEXT)
+            #активация бесплатной подписки на 7 дней всем пользователям, активирующим бота
+            try:
+                await extend_vip(user_id, 7)
+                await msg.answer("🎁 Вам активирована бесплатная VIP-подписка на 7 дней!")
+            except Exception:
+                await msg.answer("🎁 Вам доступен бесплатный VIP на 7 дней. Активируйте его через /vip.")
         await set_forwarding(user_id, True)
         await msg.answer("Пересылка сообщений активирована ✅")
 
@@ -424,10 +448,20 @@ async def main():
                 f"Вы выбрали подписку на {tariff['title']}. "
                 "Выберите способ оплаты:"
             )
-            await cb.message.edit_text(
-                text,
-                reply_markup=build_vip_payment_kb(callback_data.plan),
-            )
+            try:
+                await cb.message.edit_text(
+                    text,
+                    reply_markup=build_vip_payment_kb(callback_data.plan),
+                )
+            except TelegramBadRequest:
+                await cb.message.answer(
+                    text,
+                    reply_markup=build_vip_payment_kb(callback_data.plan),
+                )
+                try:
+                    await cb.message.delete()
+                except Exception:
+                    pass
             await cb.answer()
             return
 
@@ -441,7 +475,10 @@ async def main():
         if callback_data.action == "pay_card" and callback_data.plan:
             plan = callback_data.plan
             try:
-                payment_id, confirmation_url = await yk_create_payment(cb.from_user.id, plan)
+                payment_id, confirmation = await yk_create_payment(cb.from_user.id, plan)
+                confirmation_url = confirmation.get("confirmation_url")
+                if not confirmation_url:
+                    raise RuntimeError("Не удалось получить ссылку на оплату.")
             except Exception as e:
                 await cb.message.edit_text(f"❌ Не удалось создать платёж: {e}")
                 await cb.answer()
@@ -461,12 +498,78 @@ async def main():
             await cb.answer()
             return
 
+        if callback_data.action == "pay_qr" and callback_data.plan:
+            plan = callback_data.plan
+            try:
+                payment_id, confirmation = await yk_create_payment(
+                    cb.from_user.id,
+                    plan,
+                    confirmation_type="qr",
+                    payment_method_data={"type": "sbp"},
+                )
+            except YkBadRequestError as e:
+                await cb.message.edit_text(
+                    "❌ Не удалось создать платёж СБП. Проверьте, что СБП включён в YooKassa "
+                    "и доступен для вашего магазина.\n\n"
+                    f"Техническая ошибка: {e}"
+                )
+                await cb.answer()
+                return
+            except Exception as e:
+                await cb.message.edit_text(f"❌ Не удалось создать платёж: {e}")
+                await cb.answer()
+                return
+
+            confirmation_url = confirmation.get("confirmation_url")
+            confirmation_data = confirmation.get("confirmation_data")
+            if not confirmation_url and not confirmation_data:
+                await cb.message.edit_text("❌ Не удалось получить данные для оплаты по СБП.")
+                await cb.answer()
+                return
+            qr_payments[(cb.from_user.id, plan)] = payment_id
+            tariff = get_tariff(plan)
+            kb = [
+                [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=VipCb(action="check_qr", plan=plan).pack())],
+                [InlineKeyboardButton(text="← Назад", callback_data=VipCb(action="back_pay", plan=plan).pack())],
+            ]
+            if confirmation_url:
+                kb.insert(0, [InlineKeyboardButton(text="💠 Оплатить по СБП", url=confirmation_url)])
+                await cb.message.edit_text(
+                    text=(
+                        "Нажмите «Оплатить», завершите оплату по СБП и затем вернитесь сюда и "
+                        "нажмите «Проверить оплату»."
+                    ),
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+                    disable_web_page_preview=True,
+                )
+            else:
+                qr = qrcode.QRCode(border=2, box_size=6)
+                qr.add_data(confirmation_data)
+                qr.make(fit=True)
+                img = qr.make_image(fill_color="black", back_color="white")
+                buf = BytesIO()
+                img.save(buf, format="PNG")
+                buf.seek(0)
+                await cb.message.answer_photo(
+                    BufferedInputFile(buf.getvalue(), filename="sbp_qr.png"),
+                    caption=f"Отсканируйте QR для оплаты {tariff['price']}₽ по СБП.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+                )
+                try:
+                    await cb.message.delete()
+                except Exception:
+                    pass
+            await cb.answer()
+            return
+
 
         if callback_data.action == "pay_stars" and callback_data.plan:
             tariff = get_tariff(callback_data.plan)
 
             provider_token = os.getenv("STARS_PROVIDER_TOKEN", "STARS")
             payload = f"vip:{callback_data.plan}:{uuid.uuid4()}"
+            stars_payloads[payload] = callback_data.plan
+            stars_last_plan[cb.from_user.id] = callback_data.plan
 
             try:
                 invoice_url = await cb.bot.create_invoice_link(
@@ -481,8 +584,6 @@ async def main():
                 await cb.message.edit_text(f"❌ Не удалось подготовить оплату Stars: {e}")
                 await cb.answer()
                 return
-            stars_payloads[payload] = callback_data.plan
-            stars_last_plan[cb.from_user.id] = callback_data.plan
 
             text = (
                 "Стоимость премиума:\n"
@@ -524,6 +625,34 @@ async def main():
                     await cb.message.edit_text(f"✅ Оплата прошла успешно. Подписка активна до {vip_date}.")
                 else:
                     await cb.message.edit_text("✅ Оплата прошла успешно. Доступ к VIP включён.")
+            else:
+                await cb.answer("⏳ Платёж ещё не завершён. Попробуйте позже.", show_alert=True)
+            return
+
+        if callback_data.action == "check_qr" and callback_data.plan:
+            plan = callback_data.plan
+            payment_id = qr_payments.get((cb.from_user.id, plan))
+            if not payment_id:
+                await cb.answer("Платёж не найден. Попробуйте создать QR ещё раз.", show_alert=True)
+                return
+            try:
+                status = await yk_check_payment(payment_id)
+            except Exception as e:
+                await cb.answer(f"❌ Ошибка проверки: {e}", show_alert=True)
+                return
+
+            if status == "succeeded":
+                tariff = get_tariff(plan)
+                days = get_tariff_days(plan, tariff)
+                if not days:
+                    await cb.message.answer("⚠️ Не удалось активировать VIP: отсутствует срок тарифа.")
+                    return
+                vip_res = await extend_vip(cb.from_user.id, int(days))
+                vip_date = format_vip_until(vip_res.get("vip_until"))
+                if vip_date:
+                    await cb.message.answer(f"✅ Оплата прошла успешно. Подписка активна до {vip_date}.")
+                else:
+                    await cb.message.answer("✅ Оплата прошла успешно. Доступ к VIP включён.")
             else:
                 await cb.answer("⏳ Платёж ещё не завершён. Попробуйте позже.", show_alert=True)
             return

@@ -12,3 +12,6 @@ my-feed/.venv/
 # python cache
 __pycache__/
 *.pyc
+
+# media files
+media/

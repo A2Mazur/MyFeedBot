@@ -19,6 +19,7 @@ class Channel(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     username: Mapped[str] = mapped_column(String(255))
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     __table_args__ = (UniqueConstraint("user_id", "username", name="uq_user_channel"),)
     last_tg_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
@@ -31,6 +32,9 @@ class Post(Base):
     )
     tg_message_id: Mapped[int] = mapped_column(BigInteger)
     text: Mapped[str] = mapped_column(Text)
+    media_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    media_paths: Mapped[str | None] = mapped_column(Text, nullable=True)
+    media_group_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     is_sent: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     __table_args__ = (

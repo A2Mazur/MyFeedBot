@@ -30,9 +30,10 @@ def build_vip_tariffs_kb() -> InlineKeyboardMarkup:
 def build_vip_payment_kb(plan: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="💳 Оплата картой", callback_data=VipCb(action="pay_card", plan=plan).pack())
-    kb.button(text="⭐ Оплата звёздами", callback_data=VipCb(action="pay_stars", plan=plan).pack())
-    kb.button(text="← Назад", callback_data=VipCb(action="back").pack())
-    kb.adjust(1)
+    kb.button(text="🌳 Оплата по QR", callback_data=VipCb(action="pay_qr", plan=plan).pack())
+    kb.button(text="⭐ Telegram Stars", callback_data=VipCb(action="pay_stars", plan=plan).pack())
+    kb.button(text="⬅️ Назад", callback_data=VipCb(action="back").pack())
+    kb.adjust(2, 1, 1)
     return kb.as_markup()
 
 

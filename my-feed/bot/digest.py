@@ -59,12 +59,13 @@ def _build_prompt(posts: list[dict]) -> str:
     lines = []
     for p in posts:
         channel = p.get("channel", "")
+        channel_title = p.get("channel_title", "") or ""
         msg_id = int(p.get("tg_message_id") or 0)
         text = _normalize_text(p.get("text", ""))
         if not text:
             continue
         link = _post_link(channel, msg_id)
-        lines.append(f"CHANNEL={channel} LINK={link} TEXT={text}")
+        lines.append(f"CHANNEL={channel} TITLE={channel_title} LINK={link} TEXT={text}")
     return "\n".join(lines)
 
 
@@ -75,7 +76,8 @@ def _format_digest(items: list[dict]) -> str:
         sources = item.get("sources") or []
         links = []
         for s in sources:
-            ch = escape(str(s.get("channel", "")).strip())
+            title = str(s.get("title", "")).strip()
+            ch = escape(title if title else str(s.get("channel", "")).strip())
             link = str(s.get("link", "")).strip()
             if not ch or not link:
                 continue
@@ -124,11 +126,12 @@ async def generate_digest(posts: list[dict]) -> str:
                     "Если несколько постов про одно и то же событие, объединяй в один пункт "
                     "и перечисляй все источники. "
                     "Верни ТОЛЬКО JSON-массив объектов, без пояснений. "
+                    "Используй в источниках TITLE (название канала), не @username. "
                     "Формат объекта:\n"
                     "{\n"
                     "  \"summary\": \"одно предложение\",\n"
                     "  \"sources\": [\n"
-                    "    {\"channel\": \"@channel\", \"link\": \"https://t.me/channel/123\"}\n"
+                    "    {\"title\": \"Название канала\", \"link\": \"https://t.me/channel/123\"}\n"
                     "  ]\n"
                     "}\n"
                     "summary должно быть ОДНИМ предложением."

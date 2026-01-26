@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
+import json
 from api.db import engine, SessionLocal, Base
 import api.models
 from api.models import User, Channel, Post
@@ -21,6 +22,9 @@ class AddPostIn(BaseModel):
     tg_message_id: int
     text: str
     published_at: datetime
+    media_type: str | None = None
+    media_paths: list[str] | None = None
+    media_group_id: int | None = None
 
 class DeleteChannelIn(BaseModel):
     tg_user_id: int
@@ -37,6 +41,11 @@ class SetCursorIn(BaseModel):
 class VipExtendIn(BaseModel):
     tg_user_id: int
     days: int
+
+class SetChannelTitleIn(BaseModel):
+    tg_user_id: int
+    username: str
+    title: str
 
 
 AD_PATTERNS = [
@@ -87,6 +96,30 @@ async def on_startup():
             text(
                 "ALTER TABLE users "
                 "ADD COLUMN IF NOT EXISTS vip_until TIMESTAMPTZ NULL"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE posts "
+                "ADD COLUMN IF NOT EXISTS media_type VARCHAR(50) NULL"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE posts "
+                "ADD COLUMN IF NOT EXISTS media_paths TEXT NULL"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE posts "
+                "ADD COLUMN IF NOT EXISTS media_group_id BIGINT NULL"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE channels "
+                "ADD COLUMN IF NOT EXISTS title VARCHAR(255) NULL"
             )
         )
 
@@ -181,6 +214,31 @@ async def set_channel_cursor(payload: SetCursorIn):
 
     return {"ok": True}
 
+@app.post("/channels/title")
+async def set_channel_title(payload: SetChannelTitleIn):
+    username = payload.username.strip()
+    if not username.startswith("@"):
+        raise HTTPException(400, "username must start with @")
+    title = payload.title.strip() if payload.title else ""
+    if not title:
+        return {"ok": True, "updated": False}
+    async with SessionLocal() as session:
+        res = await session.execute(select(User).where(User.tg_user_id == payload.tg_user_id))
+        user = res.scalar_one_or_none()
+        if not user:
+            return {"ok": True, "updated": False}
+        res = await session.execute(
+            select(Channel).where(Channel.user_id == user.id, Channel.username == username)
+        )
+        channel = res.scalar_one_or_none()
+        if not channel:
+            return {"ok": True, "updated": False}
+        if channel.title != title:
+            channel.title = title
+            await session.commit()
+            return {"ok": True, "updated": True}
+    return {"ok": True, "updated": False}
+
 @app.post("/channels/delete")
 async def delete_channel(payload: DeleteChannelIn):
     username = payload.username.strip()
@@ -244,10 +302,14 @@ async def add_post(payload: AddPostIn):
         )
         if res.scalar_one_or_none():
             return {"ok": True, "message": "already exists"}
+        media_paths = json.dumps(payload.media_paths) if payload.media_paths else None
         session.add(Post(
             channel_id=channel.id,
             tg_message_id=payload.tg_message_id,
             text=payload.text or "",
+            media_type=payload.media_type,
+            media_paths=media_paths,
+            media_group_id=payload.media_group_id,
             published_at=payload.published_at,
             is_sent=False,
         ))
@@ -263,19 +325,23 @@ async def latest_posts(tg_user_id: int, limit: int = 20):
         if not user:
             return {"posts": []}
         res = await session.execute(
-            select(Post, Channel.username)
+            select(Post, Channel.username, Channel.title)
             .join(Channel, Post.channel_id == Channel.id)
             .where(Channel.user_id == user.id)
             .order_by(desc(Post.published_at))
             .limit(limit)
         )
         posts = []
-        for post, username in res.all():
+        for post, username, title in res.all():
             posts.append({
                 "id": post.id,
                 "channel": username,
+                "channel_title": title,
                 "tg_message_id": post.tg_message_id,
                 "text": post.text,
+                "media_type": post.media_type,
+                "media_paths": json.loads(post.media_paths) if post.media_paths else None,
+                "media_group_id": post.media_group_id,
                 "published_at": post.published_at.isoformat(),
                 "is_sent": post.is_sent,
             })
@@ -292,7 +358,7 @@ async def unsent_posts(tg_user_id: int, limit: int = 10):
         if not bool(user.forwarding_on):
             return {"posts": []}
         res = await session.execute(
-            select(Post, Channel.username)
+            select(Post, Channel.username, Channel.title)
             .join(Channel, Post.channel_id == Channel.id)
             .where(Channel.user_id == user.id, Post.is_sent == False)
             .order_by(Post.published_at)
@@ -300,11 +366,20 @@ async def unsent_posts(tg_user_id: int, limit: int = 10):
         )
         posts = []
         skipped_ids = []
-        for post, username in res.all():
+        for post, username, title in res.all():
             if bool(user.spam_filter_on) and looks_like_ad(post.text):
                 skipped_ids.append(post.id)
                 continue
-            posts.append({"id": post.id, "channel": username, "text": post.text})
+            posts.append({
+                "id": post.id,
+                "channel": username,
+                "channel_title": title,
+                "tg_message_id": post.tg_message_id,
+                "text": post.text,
+                "media_type": post.media_type,
+                "media_paths": json.loads(post.media_paths) if post.media_paths else None,
+                "media_group_id": post.media_group_id,
+            })
             if len(posts) >= limit:
                 break
         if skipped_ids:
