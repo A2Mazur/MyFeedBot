@@ -5,6 +5,7 @@ import uuid
 
 import httpx
 import qrcode
+import time
 from datetime import datetime, timezone
 from io import BytesIO
 from aiogram import Bot, Dispatcher, F
@@ -31,6 +32,7 @@ from bot.api_client import (
     get_spam_filter,
     list_channels,
     extend_vip,
+    upsert_user_profile,
     set_forwarding,
     set_short_feed,
     set_spam_filter,
@@ -47,6 +49,10 @@ from bot.keyboards.vip import (
     get_tariff,
 )
 from bot.parsers import extract_channels
+from bot.admin_commands import register_admin_commands
+
+OWNER_TG_USER_ID = int(os.getenv("OWNER_TG_USER_ID", "0"))
+STARS_POLL_INTERVAL_SEC = int(os.getenv("STARS_POLL_INTERVAL_SEC", "20"))
 
 
 class YkBadRequestError(Exception):
@@ -180,6 +186,68 @@ async def ensure_vip(msg: Message, feature_name: str, feature_desc: str) -> bool
     await msg.answer(text)
     return False
 
+
+async def sync_user_profile(msg: Message) -> None:
+    try:
+        await upsert_user_profile(
+            tg_user_id=msg.from_user.id,
+            username=msg.from_user.username,
+            first_name=msg.from_user.first_name,
+            last_name=msg.from_user.last_name,
+        )
+    except Exception:
+        pass
+
+
+async def stars_poll_loop(bot: Bot, pending: dict[str, dict], processed: set[str]) -> None:
+    while True:
+        if not pending:
+            await asyncio.sleep(STARS_POLL_INTERVAL_SEC)
+            continue
+        try:
+            txs = await bot.get_star_transactions(limit=100)
+            for tx in txs.transactions:
+                if tx.id in processed:
+                    continue
+                src = tx.source
+                if not src:
+                    continue
+                invoice_payload = getattr(src, "invoice_payload", None)
+                user = getattr(src, "user", None)
+                if not invoice_payload or not user:
+                    continue
+                info = pending.get(invoice_payload)
+                if not info:
+                    continue
+                if int(user.id) != int(info["user_id"]):
+                    continue
+                plan = info["plan"]
+                tariff = get_tariff(plan)
+                days = get_tariff_days(plan, tariff)
+                if not days:
+                    processed.add(tx.id)
+                    pending.pop(invoice_payload, None)
+                    continue
+                vip_res = await extend_vip(int(user.id), int(days))
+                vip_date = format_vip_until(vip_res.get("vip_until"))
+                if vip_date:
+                    await bot.send_message(
+                        int(user.id),
+                        f"✅ Оплата прошла успешно. Подписка активна до {vip_date}.",
+                    )
+                else:
+                    await bot.send_message(
+                        int(user.id),
+                        "✅ Оплата прошла успешно. Доступ к VIP включён.",
+                    )
+                processed.add(tx.id)
+                pending.pop(invoice_payload, None)
+        except Exception:
+            pass
+        await asyncio.sleep(STARS_POLL_INTERVAL_SEC)
+
+
+
 async def setup_commands(bot: Bot):
     commands = [
         BotCommand(command="subscriptions", description="Ваши подписки 📋"),
@@ -205,11 +273,14 @@ async def main():
     welcomed_users: set[int] = set()
     card_payments: dict[tuple[int, str], str] = {}
     qr_payments: dict[tuple[int, str], str] = {}
-    stars_payloads: dict[str, str] = {}
+    stars_payloads: dict[str, dict] = {}
     stars_last_plan: dict[int, str] = {}
+    stars_processed: set[str] = set()
     await setup_commands(bot)
+    asyncio.create_task(stars_poll_loop(bot, stars_payloads, stars_processed))
     @dp.message(Command("help"))
     async def cmd_help(msg: Message):
+        await sync_user_profile(msg)
         await msg.answer(
             "📰 Твоя персональная лента новостей в Telegram!\n\n"
 
@@ -231,6 +302,7 @@ async def main():
 
     @dp.message(Command("subscriptions"))
     async def cmd_subscriptions(msg: Message):
+        await sync_user_profile(msg)
         channels = await list_channels(msg.from_user.id)
         if not channels:
             await msg.answer("Подписок пока нет. Пришли @username или ссылку на канал — я добавлю ✅")
@@ -242,6 +314,7 @@ async def main():
 
     @dp.message(Command("delete"))
     async def cmd_delete(msg: Message):
+        await sync_user_profile(msg)
         channels = await list_channels(msg.from_user.id)
         if not channels:
             await msg.answer("Подписок пока нет. /subscriptions — посмотреть список")
@@ -262,6 +335,7 @@ async def main():
 
     @dp.message(Command("start"))
     async def cmd_start_forward(msg: Message):
+        await sync_user_profile(msg)
         user_id = msg.from_user.id
         if user_id not in welcomed_users:
             welcomed_users.add(user_id)
@@ -277,6 +351,7 @@ async def main():
 
     @dp.message(Command("stop"))
     async def cmd_stop_forward(msg: Message):
+        await sync_user_profile(msg)
         user_id = msg.from_user.id
         await set_forwarding(user_id, False)
         await msg.answer("Пересылка сообщений остановлена ⛔️")
@@ -284,6 +359,7 @@ async def main():
 
     @dp.message(Command("digest"))
     async def cmd_digest(msg: Message):
+        await sync_user_profile(msg)
         if not await ensure_vip(msg, "Digest", "умная сводка новостей."):
             return
         await msg.answer("Готовлю сводку... 📝")
@@ -297,6 +373,7 @@ async def main():
 
     @dp.message(Command("spam"))
     async def cmd_spam(msg: Message):
+        await sync_user_profile(msg)
         if not await ensure_vip(msg, "Spam", "фильтр, скрывающий рекламные публикации."):
             return
         user_id = msg.from_user.id
@@ -310,6 +387,7 @@ async def main():
 
     @dp.message(Command("switch_feed"))
     async def cmd_switch_feed(msg: Message):
+        await sync_user_profile(msg)
         if not await ensure_vip(msg, "Switch Feed", "переключение между полной и краткой лентой."):
             return
         user_id = msg.from_user.id
@@ -323,14 +401,18 @@ async def main():
 
     @dp.message(Command("vip"))
     async def cmd_vip(msg: Message):
+        await sync_user_profile(msg)
         status = await get_vip_status(msg.from_user.id)
         text = build_vip_screen_text(status.get("vip_until"))
         await msg.answer(text, reply_markup=build_vip_tariffs_kb())
+
+    register_admin_commands(dp, OWNER_TG_USER_ID)
 
     @dp.message()
     async def any_text(msg: Message):
         if msg.successful_payment:
             return
+        await sync_user_profile(msg)
         text = msg.text or ""
         channels = extract_channels(text)
 
@@ -568,7 +650,11 @@ async def main():
 
             provider_token = os.getenv("STARS_PROVIDER_TOKEN", "STARS")
             payload = f"vip:{callback_data.plan}:{uuid.uuid4()}"
-            stars_payloads[payload] = callback_data.plan
+            stars_payloads[payload] = {
+                "user_id": cb.from_user.id,
+                "plan": callback_data.plan,
+                "created_at": time.time(),
+            }
             stars_last_plan[cb.from_user.id] = callback_data.plan
 
             try:
@@ -599,6 +685,7 @@ async def main():
             )
             await cb.answer()
             return
+
 
         if callback_data.action == "check_card" and callback_data.plan:
             plan = callback_data.plan

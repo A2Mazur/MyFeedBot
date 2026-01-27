@@ -72,6 +72,59 @@ async def set_short_feed(tg_user_id: int, enabled: bool) -> dict:
         r.raise_for_status()
         return r.json()
 
+async def get_admin_stats(tg_user_id: int) -> dict:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(f"{API_URL}/admin/stats", params={"tg_user_id": tg_user_id})
+        r.raise_for_status()
+        return r.json()
+
+async def admin_grant_vip(admin_tg_user_id: int, tg_user_id: int, days: int | None = None, forever: bool = False) -> dict:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(f"{API_URL}/admin/vip_grant", json={
+            "admin_tg_user_id": admin_tg_user_id,
+            "tg_user_id": tg_user_id,
+            "days": days,
+            "forever": forever,
+        })
+        r.raise_for_status()
+        return r.json()
+
+async def admin_revoke_vip(admin_tg_user_id: int, tg_user_id: int) -> dict:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(f"{API_URL}/admin/vip_revoke", json={
+            "admin_tg_user_id": admin_tg_user_id,
+            "tg_user_id": tg_user_id,
+        })
+        r.raise_for_status()
+        return r.json()
+
+async def upsert_user_profile(tg_user_id: int, username: str | None, first_name: str | None, last_name: str | None) -> None:
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(f"{API_URL}/users/profile", json={
+            "tg_user_id": tg_user_id,
+            "username": username,
+            "first_name": first_name,
+            "last_name": last_name,
+        })
+        r.raise_for_status()
+
+async def resolve_user_id(username: str) -> int | None:
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(f"{API_URL}/users/resolve", params={"username": username})
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json().get("tg_user_id")
+
+async def get_broadcast_targets(admin_tg_user_id: int, group: str | None = None) -> list[int]:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(f"{API_URL}/admin/broadcast_targets", json={
+            "admin_tg_user_id": admin_tg_user_id,
+            "group": group,
+        })
+        r.raise_for_status()
+        return r.json().get("targets", [])
+
 async def get_vip_status(tg_user_id: int) -> dict:
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(f"{API_URL}/users/vip_status", params={"tg_user_id": tg_user_id})

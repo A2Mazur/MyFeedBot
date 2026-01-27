@@ -8,6 +8,9 @@ class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(primary_key=True)
     tg_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     forwarding_on: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     spam_filter_on: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     short_feed_on: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

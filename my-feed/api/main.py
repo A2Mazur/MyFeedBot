@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
@@ -11,6 +13,7 @@ import re
 
 
 app = FastAPI(title="MyFeed API")
+OWNER_TG_USER_ID = int(os.getenv("OWNER_TG_USER_ID", "0"))
 
 class AddChannelIn(BaseModel):
     tg_user_id: int
@@ -46,6 +49,26 @@ class SetChannelTitleIn(BaseModel):
     tg_user_id: int
     username: str
     title: str
+
+class AdminVipGrantIn(BaseModel):
+    admin_tg_user_id: int
+    tg_user_id: int
+    days: int | None = None
+    forever: bool = False
+
+class AdminVipRevokeIn(BaseModel):
+    admin_tg_user_id: int
+    tg_user_id: int
+
+class UserProfileIn(BaseModel):
+    tg_user_id: int
+    username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+
+class AdminBroadcastQuery(BaseModel):
+    admin_tg_user_id: int
+    group: str | None = None  # vip|free|active|all
 
 
 AD_PATTERNS = [
@@ -96,6 +119,24 @@ async def on_startup():
             text(
                 "ALTER TABLE users "
                 "ADD COLUMN IF NOT EXISTS vip_until TIMESTAMPTZ NULL"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE users "
+                "ADD COLUMN IF NOT EXISTS username VARCHAR(255) NULL"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE users "
+                "ADD COLUMN IF NOT EXISTS first_name VARCHAR(255) NULL"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE users "
+                "ADD COLUMN IF NOT EXISTS last_name VARCHAR(255) NULL"
             )
         )
         await conn.execute(
@@ -426,6 +467,66 @@ async def set_user_forwarding(tg_user_id: int, enabled: bool = Body(...)):
         return {"ok": True, "enabled": bool(user.forwarding_on)}
 
 
+@app.post("/users/profile")
+async def upsert_user_profile(payload: UserProfileIn):
+    async with SessionLocal() as session:
+        res = await session.execute(select(User).where(User.tg_user_id == payload.tg_user_id))
+        user = res.scalar_one_or_none()
+        if not user:
+            user = User(tg_user_id=payload.tg_user_id)
+            session.add(user)
+            await session.flush()
+        username = (payload.username or "").strip() or None
+        if username and not username.startswith("@"):
+            username = f"@{username}"
+        user.username = username
+        user.first_name = payload.first_name or user.first_name
+        user.last_name = payload.last_name or user.last_name
+        await session.commit()
+        return {"ok": True}
+
+
+@app.get("/users/resolve")
+async def resolve_user_id(username: str):
+    username = username.strip()
+    if not username:
+        raise HTTPException(400, "username required")
+    if not username.startswith("@"):
+        username = f"@{username}"
+    async with SessionLocal() as session:
+        res = await session.execute(select(User).where(User.username == username))
+        user = res.scalar_one_or_none()
+        if not user:
+            raise HTTPException(404, "user not found")
+        return {"tg_user_id": user.tg_user_id}
+
+
+@app.post("/admin/broadcast_targets")
+async def get_broadcast_targets(payload: AdminBroadcastQuery):
+    if OWNER_TG_USER_ID and payload.admin_tg_user_id != OWNER_TG_USER_ID:
+        raise HTTPException(403, "forbidden")
+    group = (payload.group or "all").lower()
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        stmt = select(User.tg_user_id)
+        if group == "vip":
+            stmt = stmt.where(User.vip_until.is_not(None), User.vip_until > now)
+        elif group == "free":
+            stmt = stmt.where((User.vip_until.is_(None)) | (User.vip_until <= now))
+        elif group == "active":
+            cutoff = now - timedelta(days=7)
+            active_ids = (
+                select(func.distinct(Channel.user_id))
+                .select_from(Post)
+                .join(Channel, Post.channel_id == Channel.id)
+                .where(Post.is_sent == True, Post.published_at >= cutoff)
+            )
+            stmt = stmt.where(User.id.in_(active_ids))
+        res = await session.execute(stmt)
+        ids = [row[0] for row in res.all()]
+        return {"targets": ids}
+
+
 @app.get("/users/spam_filter")
 async def get_user_spam_filter(tg_user_id: int):
     async with SessionLocal() as session:
@@ -479,6 +580,111 @@ async def set_user_short_feed(tg_user_id: int, enabled: bool = Body(...)):
         user.short_feed_on = bool(enabled)
         await session.commit()
         return {"ok": True, "enabled": bool(user.short_feed_on)}
+
+
+@app.get("/admin/stats")
+async def get_admin_stats(tg_user_id: int):
+    if OWNER_TG_USER_ID and tg_user_id != OWNER_TG_USER_ID:
+        raise HTTPException(403, "forbidden")
+    now = datetime.now(timezone.utc)
+    cutoff_7d = now - timedelta(days=7)
+    async with SessionLocal() as session:
+        total_users = int((await session.execute(select(func.count(User.id)))).scalar() or 0)
+        forwarding_on = int((await session.execute(
+            select(func.count(User.id)).where(User.forwarding_on == True)
+        )).scalar() or 0)
+        short_feed_on = int((await session.execute(
+            select(func.count(User.id)).where(User.short_feed_on == True)
+        )).scalar() or 0)
+        spam_filter_on = int((await session.execute(
+            select(func.count(User.id)).where(User.spam_filter_on == True)
+        )).scalar() or 0)
+        vip_active = int((await session.execute(
+            select(func.count(User.id)).where(User.vip_until.is_not(None), User.vip_until > now)
+        )).scalar() or 0)
+        vip_expiring_7d = int((await session.execute(
+            select(func.count(User.id)).where(User.vip_until.is_not(None), User.vip_until > now, User.vip_until <= now + timedelta(days=7))
+        )).scalar() or 0)
+        channels_total = int((await session.execute(select(func.count(Channel.id)))).scalar() or 0)
+
+        posts_7d = int((await session.execute(
+            select(func.count(Post.id)).where(Post.is_sent == True, Post.published_at >= cutoff_7d)
+        )).scalar() or 0)
+        active_users_7d = int((await session.execute(
+            select(func.count(func.distinct(Channel.user_id)))
+            .select_from(Post)
+            .join(Channel, Post.channel_id == Channel.id)
+            .where(Post.is_sent == True, Post.published_at >= cutoff_7d)
+        )).scalar() or 0)
+
+        top_activity = (await session.execute(
+            select(Channel.user_id, func.count(Post.id).label("cnt"))
+            .select_from(Post)
+            .join(Channel, Post.channel_id == Channel.id)
+            .where(Post.is_sent == True, Post.published_at >= cutoff_7d)
+            .group_by(Channel.user_id)
+            .order_by(func.count(Post.id).desc())
+            .limit(10)
+        )).all()
+
+        top_channels = (await session.execute(
+            select(Channel.user_id, func.count(Channel.id).label("cnt"))
+            .group_by(Channel.user_id)
+            .order_by(func.count(Channel.id).desc())
+            .limit(10)
+        )).all()
+
+    return {
+        "users_total": total_users,
+        "forwarding_on": forwarding_on,
+        "short_feed_on": short_feed_on,
+        "spam_filter_on": spam_filter_on,
+        "vip_active": vip_active,
+        "vip_expiring_7d": vip_expiring_7d,
+        "channels_total": channels_total,
+        "posts_7d": posts_7d,
+        "active_users_7d": active_users_7d,
+        "top_activity_7d": [{"user_id": uid, "count": cnt} for uid, cnt in top_activity],
+        "top_channels": [{"user_id": uid, "count": cnt} for uid, cnt in top_channels],
+    }
+
+
+@app.post("/admin/vip_grant")
+async def admin_grant_vip(payload: AdminVipGrantIn):
+    if OWNER_TG_USER_ID and payload.admin_tg_user_id != OWNER_TG_USER_ID:
+        # allow only admin to call this endpoint
+        raise HTTPException(403, "forbidden")
+    async with SessionLocal() as session:
+        res = await session.execute(select(User).where(User.tg_user_id == payload.tg_user_id))
+        user = res.scalar_one_or_none()
+        if not user:
+            user = User(tg_user_id=payload.tg_user_id)
+            session.add(user)
+            await session.flush()
+        now = datetime.now(timezone.utc)
+        if payload.forever:
+            user.vip_until = now + timedelta(days=365 * 100)
+        else:
+            if not payload.days or payload.days <= 0:
+                raise HTTPException(400, "days must be > 0")
+            base = user.vip_until if user.vip_until and user.vip_until > now else now
+            user.vip_until = base + timedelta(days=payload.days)
+        await session.commit()
+        return {"ok": True, "vip_until": user.vip_until.isoformat()}
+
+
+@app.post("/admin/vip_revoke")
+async def admin_revoke_vip(payload: AdminVipRevokeIn):
+    if OWNER_TG_USER_ID and payload.admin_tg_user_id != OWNER_TG_USER_ID:
+        raise HTTPException(403, "forbidden")
+    async with SessionLocal() as session:
+        res = await session.execute(select(User).where(User.tg_user_id == payload.tg_user_id))
+        user = res.scalar_one_or_none()
+        if not user:
+            return {"ok": True, "revoked": False}
+        user.vip_until = None
+        await session.commit()
+        return {"ok": True, "revoked": True}
 
 
 @app.get("/users/vip_status")
