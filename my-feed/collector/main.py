@@ -16,14 +16,22 @@ INTERVAL = int(os.getenv("COLLECT_INTERVAL_SEC", "60"))
 MEDIA_TTL_DAYS = int(os.getenv("MEDIA_TTL_DAYS", "3"))
 MEDIA_CLEAN_INTERVAL_SEC = int(os.getenv("MEDIA_CLEAN_INTERVAL_SEC", "3600"))
 
-async def fetch_channels(api: httpx.AsyncClient):
-    r = await api.get(f"{API_URL}/channels/list", params={"tg_user_id": OWNER_TG_USER_ID})
+async def fetch_user_ids(api: httpx.AsyncClient) -> list[int]:
+    r = await api.post(
+        f"{API_URL}/admin/broadcast_targets",
+        json={"admin_tg_user_id": OWNER_TG_USER_ID, "group": "all"},
+    )
+    r.raise_for_status()
+    return r.json().get("targets", [])
+
+async def fetch_channels(api: httpx.AsyncClient, tg_user_id: int) -> list[str]:
+    r = await api.get(f"{API_URL}/channels/list", params={"tg_user_id": tg_user_id})
     r.raise_for_status()
     return r.json().get("channels", [])
 
-async def send_post(api: httpx.AsyncClient, channel: str, msg_id: int, text: str, published_at):
+async def send_post(api: httpx.AsyncClient, tg_user_id: int, channel: str, msg_id: int, text: str, published_at):
     payload = {
-        "tg_user_id": OWNER_TG_USER_ID,
+        "tg_user_id": tg_user_id,
         "channel_username": channel,
         "tg_message_id": msg_id,
         "text": text,
@@ -34,6 +42,7 @@ async def send_post(api: httpx.AsyncClient, channel: str, msg_id: int, text: str
 
 async def send_post_with_media(
     api: httpx.AsyncClient,
+    tg_user_id: int,
     channel: str,
     msg_id: int,
     text: str,
@@ -43,7 +52,7 @@ async def send_post_with_media(
     media_group_id: int | None,
 ):
     payload = {
-        "tg_user_id": OWNER_TG_USER_ID,
+        "tg_user_id": tg_user_id,
         "channel_username": channel,
         "tg_message_id": msg_id,
         "text": text,
@@ -70,26 +79,26 @@ async def download_media(tg, message, channel: str, suffix: str) -> str | None:
         logging.exception("Failed to download media")
         return None
 
-async def get_cursor(api: httpx.AsyncClient, channel: str) -> int | None:
+async def get_cursor(api: httpx.AsyncClient, tg_user_id: int, channel: str) -> int | None:
     r = await api.get(f"{API_URL}/channels/cursor", params={
-        "tg_user_id": OWNER_TG_USER_ID,
+        "tg_user_id": tg_user_id,
         "username": channel
     })
     r.raise_for_status()
     v = r.json().get("last_tg_message_id")
     return int(v) if v is not None else None
 
-async def set_cursor(api: httpx.AsyncClient, channel: str, last_id: int) -> None:
+async def set_cursor(api: httpx.AsyncClient, tg_user_id: int, channel: str, last_id: int) -> None:
     r = await api.post(f"{API_URL}/channels/cursor", json={
-        "tg_user_id": OWNER_TG_USER_ID,
+        "tg_user_id": tg_user_id,
         "username": channel,
         "last_tg_message_id": int(last_id)
     })
     r.raise_for_status()
 
-async def set_channel_title(api: httpx.AsyncClient, channel: str, title: str) -> None:
+async def set_channel_title(api: httpx.AsyncClient, tg_user_id: int, channel: str, title: str) -> None:
     r = await api.post(f"{API_URL}/channels/title", json={
-        "tg_user_id": OWNER_TG_USER_ID,
+        "tg_user_id": tg_user_id,
         "username": channel,
         "title": title,
     })
@@ -102,106 +111,115 @@ async def main():
     last_media_cleanup = 0.0
     async with httpx.AsyncClient(timeout=20) as api:
         while True:
-            channels = await fetch_channels(api)
+            try:
+                targets = await fetch_user_ids(api)
+            except Exception as e:
+                logging.exception(f"Failed to load user targets: {e}")
+                targets = []
 
-            for ch in channels:
-                try:
-                    entity = await tg.get_entity(ch)
-                    title = getattr(entity, "title", None)
-                    if title:
-                        await set_channel_title(api, ch, title)
-                    cursor = await get_cursor(api, ch)
-                    msgs = await tg.get_messages(entity, limit=10)
-                    if not msgs:
-                        continue
-                    newest = max((m.id for m in msgs if m.id), default=None)
-                    if newest is None:
-                        continue
-                    if cursor is None:
-                        await set_cursor(api, ch, newest)
-                        logging.info(f"Baseline set for {ch}: last_tg_message_id={newest} (no send)")
-                        continue
+            for user_id in targets:
+                channels = await fetch_channels(api, user_id)
 
-                    new_msgs = [m for m in msgs if m.id and m.id > cursor]
-                    if not new_msgs:
-                        logging.info(f"No new posts in {ch} (cursor={cursor}, last={newest})")
-                        continue
-
-                    grouped = {}
-                    singles = []
-                    for m in new_msgs:
-                        if m.grouped_id:
-                            grouped.setdefault(m.grouped_id, []).append(m)
-                        else:
-                            singles.append(m)
-
-                    for group_id, items in grouped.items():
-                        items.sort(key=lambda x: x.id)
-                        media_paths = []
-                        media_type = "media_group"
-                        caption_text = ""
-                        for idx, item in enumerate(items, start=1):
-                            if item.message:
-                                caption_text = item.message.strip()
-                            if getattr(item, "photo", None) or getattr(item, "video", None) or getattr(item, "document", None):
-                                saved = await download_media(tg, item, ch, f"g{group_id}_{idx}")
-                                if saved:
-                                    media_paths.append(saved)
-                        if not media_paths:
+                for ch in channels:
+                    try:
+                        entity = await tg.get_entity(ch)
+                        title = getattr(entity, "title", None)
+                        if title:
+                            await set_channel_title(api, user_id, ch, title)
+                        cursor = await get_cursor(api, user_id, ch)
+                        msgs = await tg.get_messages(entity, limit=10)
+                        if not msgs:
                             continue
-                        published = items[-1].date
-                        if published.tzinfo is None:
-                            published = published.replace(tzinfo=timezone.utc)
-                        await send_post_with_media(
-                            api,
-                            channel=ch,
-                            msg_id=items[-1].id,
-                            text=caption_text,
-                            published_at=published.isoformat(),
-                            media_type=media_type,
-                            media_paths=media_paths,
-                            media_group_id=group_id,
-                        )
+                        newest = max((m.id for m in msgs if m.id), default=None)
+                        if newest is None:
+                            continue
+                        if cursor is None:
+                            await set_cursor(api, user_id, ch, newest)
+                            logging.info(f"Baseline set for {ch} (user={user_id}): last_tg_message_id={newest} (no send)")
+                            continue
 
-                    for m in singles:
-                        text = (m.message or "").strip()
-                        media_type = None
-                        media_paths = None
-                        if getattr(m, "photo", None):
-                            media_type = "photo"
-                            saved = await download_media(tg, m, ch, "photo")
-                            media_paths = [saved] if saved else None
-                        elif getattr(m, "video", None):
-                            media_type = "video"
-                            saved = await download_media(tg, m, ch, "video")
-                            media_paths = [saved] if saved else None
-                        elif getattr(m, "voice", None):
-                            media_type = "voice"
-                            saved = await download_media(tg, m, ch, "voice")
-                            media_paths = [saved] if saved else None
-                        elif getattr(m, "document", None):
-                            media_type = "document"
-                            saved = await download_media(tg, m, ch, "doc")
-                            media_paths = [saved] if saved else None
+                        new_msgs = [m for m in msgs if m.id and m.id > cursor]
+                        if not new_msgs:
+                            logging.info(f"No new posts in {ch} (user={user_id}, cursor={cursor}, last={newest})")
+                            continue
 
-                        published = m.date
-                        if published.tzinfo is None:
-                            published = published.replace(tzinfo=timezone.utc)
-                        await send_post_with_media(
-                            api,
-                            channel=ch,
-                            msg_id=m.id,
-                            text=text,
-                            published_at=published.isoformat(),
-                            media_type=media_type,
-                            media_paths=media_paths,
-                            media_group_id=None,
-                        )
+                        grouped = {}
+                        singles = []
+                        for m in new_msgs:
+                            if m.grouped_id:
+                                grouped.setdefault(m.grouped_id, []).append(m)
+                            else:
+                                singles.append(m)
 
-                    await set_cursor(api, ch, max(m.id for m in new_msgs))
-                    logging.info(f"New posts from {ch}: {len(new_msgs)}")
-                except Exception as e:
-                    logging.exception(f"Collector error for {ch}: {e}")
+                        for group_id, items in grouped.items():
+                            items.sort(key=lambda x: x.id)
+                            media_paths = []
+                            media_type = "media_group"
+                            caption_text = ""
+                            for idx, item in enumerate(items, start=1):
+                                if item.message:
+                                    caption_text = item.message.strip()
+                                if getattr(item, "photo", None) or getattr(item, "video", None) or getattr(item, "document", None):
+                                    saved = await download_media(tg, item, ch, f"g{group_id}_{idx}")
+                                    if saved:
+                                        media_paths.append(saved)
+                            if not media_paths:
+                                continue
+                            published = items[-1].date
+                            if published.tzinfo is None:
+                                published = published.replace(tzinfo=timezone.utc)
+                            await send_post_with_media(
+                                api,
+                                tg_user_id=user_id,
+                                channel=ch,
+                                msg_id=items[-1].id,
+                                text=caption_text,
+                                published_at=published.isoformat(),
+                                media_type=media_type,
+                                media_paths=media_paths,
+                                media_group_id=group_id,
+                            )
+
+                        for m in singles:
+                            text = (m.message or "").strip()
+                            media_type = None
+                            media_paths = None
+                            if getattr(m, "photo", None):
+                                media_type = "photo"
+                                saved = await download_media(tg, m, ch, "photo")
+                                media_paths = [saved] if saved else None
+                            elif getattr(m, "video", None):
+                                media_type = "video"
+                                saved = await download_media(tg, m, ch, "video")
+                                media_paths = [saved] if saved else None
+                            elif getattr(m, "voice", None):
+                                media_type = "voice"
+                                saved = await download_media(tg, m, ch, "voice")
+                                media_paths = [saved] if saved else None
+                            elif getattr(m, "document", None):
+                                media_type = "document"
+                                saved = await download_media(tg, m, ch, "doc")
+                                media_paths = [saved] if saved else None
+
+                            published = m.date
+                            if published.tzinfo is None:
+                                published = published.replace(tzinfo=timezone.utc)
+                            await send_post_with_media(
+                                api,
+                                tg_user_id=user_id,
+                                channel=ch,
+                                msg_id=m.id,
+                                text=text,
+                                published_at=published.isoformat(),
+                                media_type=media_type,
+                                media_paths=media_paths,
+                                media_group_id=None,
+                            )
+
+                        await set_cursor(api, user_id, ch, max(m.id for m in new_msgs))
+                        logging.info(f"New posts from {ch} (user={user_id}): {len(new_msgs)}")
+                    except Exception as e:
+                        logging.exception(f"Collector error for {ch} (user={user_id}): {e}")
 
             now = time.time()
             if now - last_media_cleanup >= MEDIA_CLEAN_INTERVAL_SEC:

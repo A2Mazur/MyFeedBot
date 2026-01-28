@@ -10,4 +10,6 @@ celery = Celery(
     backend=f"redis://{redis_host}:{redis_port}/1",
 )
 
+celery.conf.broker_connection_retry_on_startup = True
+
 celery.autodiscover_tasks(["worker"])
