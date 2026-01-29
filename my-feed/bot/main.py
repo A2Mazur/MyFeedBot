@@ -408,10 +408,8 @@ async def main():
 
     register_admin_commands(dp, OWNER_TG_USER_ID)
 
-    @dp.message()
+    @dp.message(F.text & ~F.successful_payment)
     async def any_text(msg: Message):
-        if msg.successful_payment:
-            return
         await sync_user_profile(msg)
         text = msg.text or ""
         channels = extract_channels(text)
@@ -754,14 +752,25 @@ async def main():
     async def on_successful_payment(msg: Message):
         payload = msg.successful_payment.invoice_payload
         plan = None
-        if payload.startswith("vip:"):
-            parts = payload.split(":")
-            if len(parts) >= 2:
-                plan = parts[1]
+        if payload:
+            if payload.startswith("vip:"):
+                parts = payload.split(":")
+                if len(parts) >= 2:
+                    plan = parts[1]
+            elif payload.startswith("vip_stars_"):
+                plan = payload.split("vip_stars_", 1)[1]
+        if not plan and payload:
+            info = stars_payloads.get(payload)
+            if isinstance(info, dict):
+                plan = info.get("plan")
         if not plan:
-            plan = stars_payloads.get(payload) or stars_last_plan.get(msg.from_user.id)
+            plan = stars_last_plan.get(msg.from_user.id)
         if plan:
-            tariff = get_tariff(plan)
+            try:
+                tariff = get_tariff(plan)
+            except KeyError:
+                await msg.answer("✅ Оплата прошла успешно. Доступ к VIP включён.")
+                return
             days = get_tariff_days(plan, tariff)
             if not days:
                 await msg.answer("⚠️ Не удалось активировать VIP: отсутствует срок тарифа.")
