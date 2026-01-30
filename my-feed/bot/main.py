@@ -30,6 +30,7 @@ from bot.api_client import (
     get_vip_status,
     get_short_feed,
     get_spam_filter,
+    first_start,
     list_channels,
     extend_vip,
     upsert_user_profile,
@@ -270,7 +271,6 @@ async def main():
     bot = Bot(token=token)
     asyncio.create_task(feed_loop(bot))
     dp = Dispatcher()
-    welcomed_users: set[int] = set()
     card_payments: dict[tuple[int, str], str] = {}
     qr_payments: dict[tuple[int, str], str] = {}
     stars_payloads: dict[str, dict] = {}
@@ -337,15 +337,14 @@ async def main():
     async def cmd_start_forward(msg: Message):
         await sync_user_profile(msg)
         user_id = msg.from_user.id
-        if user_id not in welcomed_users:
-            welcomed_users.add(user_id)
-            await msg.answer(WELCOME_TEXT)
-            #активация бесплатной подписки на 7 дней всем пользователям, активирующим бота
-            try:
-                await extend_vip(user_id, 7)
+        try:
+            start_info = await first_start(user_id, trial_days=7)
+            if start_info.get("welcome_needed"):
+                await msg.answer(WELCOME_TEXT)
+            if start_info.get("trial_granted"):
                 await msg.answer("🎁 Вам активирована бесплатная VIP-подписка на 7 дней!")
-            except Exception:
-                await msg.answer("🎁 Вам доступен бесплатный VIP на 7 дней. Активируйте его через /vip.")
+        except Exception:
+            logging.exception("Failed to process first_start for user %s", user_id)
         await set_forwarding(user_id, True)
         await msg.answer("Пересылка сообщений активирована ✅")
 

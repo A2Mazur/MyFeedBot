@@ -42,6 +42,15 @@ async def set_forwarding(tg_user_id: int, enabled: bool) -> dict:
         r.raise_for_status()
         return r.json()
 
+async def first_start(tg_user_id: int, trial_days: int = 7) -> dict:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(f"{API_URL}/users/first_start", json={
+            "tg_user_id": tg_user_id,
+            "trial_days": trial_days,
+        })
+        r.raise_for_status()
+        return r.json()
+
 async def get_forwarding(tg_user_id: int) -> bool:
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(f"{API_URL}/users/forwarding", params={"tg_user_id": tg_user_id})

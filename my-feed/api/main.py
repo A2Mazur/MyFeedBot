@@ -66,6 +66,10 @@ class UserProfileIn(BaseModel):
     first_name: str | None = None
     last_name: str | None = None
 
+class FirstStartIn(BaseModel):
+    tg_user_id: int
+    trial_days: int = 7
+
 class AdminBroadcastQuery(BaseModel):
     admin_tg_user_id: int
     group: str | None = None  # vip|free|active|all
@@ -113,6 +117,18 @@ async def on_startup():
             text(
                 "ALTER TABLE users "
                 "ADD COLUMN IF NOT EXISTS short_feed_on BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE users "
+                "ADD COLUMN IF NOT EXISTS welcome_sent BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE users "
+                "ADD COLUMN IF NOT EXISTS trial_vip_granted BOOLEAN NOT NULL DEFAULT FALSE"
             )
         )
         await conn.execute(
@@ -484,6 +500,33 @@ async def upsert_user_profile(payload: UserProfileIn):
         user.last_name = payload.last_name or user.last_name
         await session.commit()
         return {"ok": True}
+
+
+@app.post("/users/first_start")
+async def first_start(payload: FirstStartIn):
+    async with SessionLocal() as session:
+        res = await session.execute(select(User).where(User.tg_user_id == payload.tg_user_id))
+        user = res.scalar_one_or_none()
+        if not user:
+            user = User(tg_user_id=payload.tg_user_id)
+            session.add(user)
+            await session.flush()
+        now = datetime.now(timezone.utc)
+        welcome_needed = not bool(user.welcome_sent)
+        trial_granted = False
+        if welcome_needed:
+            user.welcome_sent = True
+        if not bool(user.trial_vip_granted):
+            base = user.vip_until if user.vip_until and user.vip_until > now else now
+            user.vip_until = base + timedelta(days=max(0, int(payload.trial_days)))
+            user.trial_vip_granted = True
+            trial_granted = True
+        await session.commit()
+        return {
+            "welcome_needed": welcome_needed,
+            "trial_granted": trial_granted,
+            "vip_until": user.vip_until.isoformat() if user.vip_until else None,
+        }
 
 
 @app.get("/users/resolve")

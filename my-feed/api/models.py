@@ -14,6 +14,8 @@ class User(Base):
     forwarding_on: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     spam_filter_on: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     short_feed_on: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    welcome_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    trial_vip_granted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     vip_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 # The table of channels that the user added
