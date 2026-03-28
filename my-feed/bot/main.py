@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from io import BytesIO
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
@@ -261,7 +261,23 @@ async def setup_commands(bot: Bot):
         BotCommand(command="delete", description="Удалить подписку ❌"),
         BotCommand(command="help", description="Инструкция бота ⚙️"),
     ]
-    await bot.set_my_commands(commands)
+    request_timeout = float(os.getenv("TG_COMMANDS_TIMEOUT_SEC", "15"))
+    max_retries = int(os.getenv("TG_COMMANDS_RETRIES", "5"))
+    for attempt in range(1, max_retries + 1):
+        try:
+            await bot.set_my_commands(commands, request_timeout=request_timeout)
+            return
+        except TelegramNetworkError as exc:
+            logging.warning(
+                "Telegram setMyCommands timeout (attempt %s/%s): %s",
+                attempt,
+                max_retries,
+                exc,
+            )
+            if attempt >= max_retries:
+                logging.warning("Skipping setMyCommands after retries.")
+                return
+            await asyncio.sleep(min(2 * attempt, 10))
 
 async def main():
     logging.basicConfig(level=logging.INFO)
