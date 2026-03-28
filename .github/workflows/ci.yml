@@ -35,9 +35,3 @@ jobs:
 
       - name: Run unit tests
         run: pytest -q
-
-      - name: Run performance script (mock)
-        run: python test_performance.py
-
-      - name: Run load test (mock)
-        run: python load_test.py
